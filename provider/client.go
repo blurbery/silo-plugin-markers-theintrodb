@@ -21,7 +21,7 @@ const (
 	maxResponseBody = 1 << 20 // 1 MB
 	defaultTimeout  = 15 * time.Second
 	defaultCacheTTL = 24 * time.Hour
-	clientUserAgent = "Silo-Server-TheIntroDB-Plugin/1.0 (+https://github.com/Silo-Server/silo-plugin-markers-introdb)"
+	clientUserAgent = "Silo-Server-TheIntroDB-Plugin/1.0 (+https://github.com/Silo-Server/silo-plugin-markers-theintrodb)"
 	// Missing and partial responses are deliberately short-lived. A later
 	// playback should be able to discover newly contributed intro or credits
 	// markers without hammering TheIntroDB on repeated starts.
