@@ -133,7 +133,6 @@ func TestFetchEpisodeCollapsesConcurrentLookups(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("first lookup did not reach server")
 	}
-	time.Sleep(25 * time.Millisecond)
 	close(releaseRequest)
 	wg.Wait()
 	close(errs)
@@ -144,6 +143,60 @@ func TestFetchEpisodeCollapsesConcurrentLookups(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Fatalf("server hits = %d, want 1 collapsed lookup", got)
+	}
+}
+
+func TestFetchEpisodeFallsBackThroughTVDBToIMDB(t *testing.T) {
+	var queries []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries = append(queries, r.URL.Query())
+		if r.URL.Query().Get("imdb_id") == "tt333" {
+			_, _ = w.Write([]byte(`{"type":"episode","credits":[{"start_ms":1200000}]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	t.Cleanup(c.Close)
+	c.SetBaseURL(srv.URL)
+	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
+	if err != nil {
+		t.Fatalf("FetchEpisode: %v", err)
+	}
+	if response == nil || len(response.Credits) != 1 {
+		t.Fatalf("response = %#v, want IMDb credits marker", response)
+	}
+	if len(queries) != 3 || queries[0].Get("tmdb_id") != "111" ||
+		queries[1].Get("tvdb_id") != "222" || queries[2].Get("imdb_id") != "tt333" {
+		t.Fatalf("queries = %#v, want TMDB, TVDB, then IMDb", queries)
+	}
+}
+
+func TestFetchEpisodeStopsFallbackAfterPartialResponse(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		if r.URL.Query().Get("tmdb_id") == "" {
+			t.Fatalf("unexpected alternate-ID request: %s", r.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte(`{"type":"episode","intro":[{"end_ms":60000}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	t.Cleanup(c.Close)
+	c.SetBaseURL(srv.URL)
+	response, err := c.FetchEpisode(context.Background(), "111", "222", "tt333", 1, 2, 0)
+	if err != nil {
+		t.Fatalf("FetchEpisode: %v", err)
+	}
+	if response == nil || len(response.Intro) != 1 || len(response.Credits) != 0 {
+		t.Fatalf("response = %#v, want partial TMDB response", response)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("server hits = %d, want no fallback after a real response", got)
 	}
 }
 

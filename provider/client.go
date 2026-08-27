@@ -162,7 +162,6 @@ func (c *Client) fetchUsingIDs(
 	tmdbID, tvdbID, imdbID string,
 	request func(externalIDCandidate) (url.Values, string),
 ) (*mediaResponse, error) {
-	hadMiss := false
 	for _, id := range externalIDCandidates(tmdbID, tvdbID, imdbID) {
 		q, key := request(id)
 		response, err := c.fetch(ctx, q, key)
@@ -174,10 +173,6 @@ func (c *Client) fetchUsingIDs(
 		if response != nil {
 			return response, nil
 		}
-		hadMiss = true
-	}
-	if hadMiss {
-		return nil, nil
 	}
 	return nil, nil
 }
@@ -215,7 +210,6 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 }
 
 func (c *Client) fetchUncached(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
-
 	if err := c.limiter.Wait(ctx); err != nil {
 		return nil, err
 	}
