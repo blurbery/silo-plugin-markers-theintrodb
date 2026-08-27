@@ -21,19 +21,37 @@ const (
 	maxResponseBody = 1 << 20 // 1 MB
 	defaultTimeout  = 15 * time.Second
 	defaultCacheTTL = 24 * time.Hour
+	clientUserAgent = "Silo-Server-TheIntroDB-Plugin/1.0 (+https://github.com/Silo-Server/silo-plugin-markers-introdb)"
+	// Missing and partial responses are deliberately short-lived. A later
+	// playback should be able to discover newly contributed intro or credits
+	// markers without hammering TheIntroDB on repeated starts.
+	defaultIncompleteCacheTTL = 15 * time.Minute
+	// A Cloudflare block is not content-specific. Continuing with alternate IDs
+	// only multiplies rejected traffic and can prolong an automated block.
+	defaultBlockedCooldown = 5 * time.Minute
 )
 
 // Client is an HTTP client for the TheIntroDB /v3/media endpoint. Each
 // instance has its own rate limiter and response cache; concurrent fetches
 // for the same lookup key collapse to a single HTTP round trip via the cache.
 type Client struct {
-	httpClient *http.Client
-	mu         sync.RWMutex
-	apiKey     string
-	baseURL    string
-	limiter    *rate.Limiter
-	cache      *ttlCache[*mediaResponse]
-	cacheTTL   time.Duration
+	httpClient         *http.Client
+	mu                 sync.RWMutex
+	apiKey             string
+	baseURL            string
+	limiter            *rate.Limiter
+	cache              *ttlCache[*mediaResponse]
+	cacheTTL           time.Duration
+	incompleteCacheTTL time.Duration
+	blockedUntil       time.Time
+	inflightMu         sync.Mutex
+	inflight           map[string]*inflightCall
+}
+
+type inflightCall struct {
+	done     chan struct{}
+	response *mediaResponse
+	err      error
 }
 
 // NewClient builds a Client with the canonical rate limit and cache TTL.
@@ -46,9 +64,11 @@ func NewClient(apiKey string) *Client {
 		baseURL:    DefaultBaseURL,
 		// TheIntroDB documents 30 requests / 10 seconds per IP. We stay
 		// conservatively below that: 2 req/s sustained, burst 5.
-		limiter:  rate.NewLimiter(2, 5),
-		cache:    newTTLCache[*mediaResponse](),
-		cacheTTL: defaultCacheTTL,
+		limiter:            rate.NewLimiter(2, 5),
+		cache:              newTTLCache[*mediaResponse](),
+		cacheTTL:           defaultCacheTTL,
+		incompleteCacheTTL: defaultIncompleteCacheTTL,
+		inflight:           make(map[string]*inflightCall),
 	}
 }
 
@@ -85,14 +105,15 @@ func (c *Client) FetchEpisode(ctx context.Context, tmdbID, tvdbID, imdbID string
 	if season <= 0 || episode <= 0 {
 		return nil, fmt.Errorf("introdb: episode lookup requires season and episode > 0 (got %d/%d)", season, episode)
 	}
-	q := url.Values{}
-	setPreferredID(q, tmdbID, tvdbID, imdbID)
-	q.Set("season", strconv.Itoa(season))
-	q.Set("episode", strconv.Itoa(episode))
-	if durationMS > 0 {
-		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
-	}
-	return c.fetch(ctx, q, cacheKeyEpisode(tmdbID, tvdbID, imdbID, season, episode, durationMS))
+	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(id externalIDCandidate) (url.Values, string) {
+		q := id.query()
+		q.Set("season", strconv.Itoa(season))
+		q.Set("episode", strconv.Itoa(episode))
+		if durationMS > 0 {
+			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
+		}
+		return q, "episode:" + q.Encode()
+	})
 }
 
 // FetchMovie looks up segment timestamps for a movie.
@@ -101,31 +122,99 @@ func (c *Client) FetchMovie(ctx context.Context, tmdbID, tvdbID, imdbID string, 
 	if tmdbID == "" && tvdbID == "" && imdbID == "" {
 		return nil, fmt.Errorf("introdb: tmdb_id, tvdb_id, or imdb_id required")
 	}
-	q := url.Values{}
-	setPreferredID(q, tmdbID, tvdbID, imdbID)
-	if durationMS > 0 {
-		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
-	}
-	return c.fetch(ctx, q, cacheKeyMovie(tmdbID, tvdbID, imdbID, durationMS))
+	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(id externalIDCandidate) (url.Values, string) {
+		q := id.query()
+		if durationMS > 0 {
+			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
+		}
+		return q, "movie:" + q.Encode()
+	})
 }
 
-// setPreferredID writes exactly one id query parameter, preferring tmdb, then
-// tvdb, then imdb. At least one is assumed non-empty by the callers.
-func setPreferredID(q url.Values, tmdbID, tvdbID, imdbID string) {
-	switch {
-	case tmdbID != "":
-		q.Set("tmdb_id", tmdbID)
-	case tvdbID != "":
-		q.Set("tvdb_id", tvdbID)
-	default:
-		q.Set("imdb_id", imdbID)
+type externalIDCandidate struct {
+	key   string
+	value string
+}
+
+func (id externalIDCandidate) query() url.Values {
+	return url.Values{id.key: []string{id.value}}
+}
+
+func externalIDCandidates(tmdbID, tvdbID, imdbID string) []externalIDCandidate {
+	ids := make([]externalIDCandidate, 0, 3)
+	if tmdbID != "" {
+		ids = append(ids, externalIDCandidate{key: "tmdb_id", value: tmdbID})
 	}
+	if tvdbID != "" {
+		ids = append(ids, externalIDCandidate{key: "tvdb_id", value: tvdbID})
+	}
+	if imdbID != "" {
+		ids = append(ids, externalIDCandidate{key: "imdb_id", value: imdbID})
+	}
+	return ids
+}
+
+// fetchUsingIDs tries identifiers in TMDB, TVDB, IMDb order. A 404 advances
+// to the next identity because TheIntroDB can have a record indexed under one
+// provider but not another. The first actual media response wins.
+func (c *Client) fetchUsingIDs(
+	ctx context.Context,
+	tmdbID, tvdbID, imdbID string,
+	request func(externalIDCandidate) (url.Values, string),
+) (*mediaResponse, error) {
+	hadMiss := false
+	for _, id := range externalIDCandidates(tmdbID, tvdbID, imdbID) {
+		q, key := request(id)
+		response, err := c.fetch(ctx, q, key)
+		if err != nil {
+			// Alternate identifiers help only when a particular identity is not
+			// indexed. They cannot recover transport, rate-limit, or WAF errors.
+			return nil, err
+		}
+		if response != nil {
+			return response, nil
+		}
+		hadMiss = true
+	}
+	if hadMiss {
+		return nil, nil
+	}
+	return nil, nil
 }
 
 func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
 	if cached, ok := c.cache.Get(key); ok {
 		return cached, nil
 	}
+	if remaining := c.blockedCooldownRemaining(); remaining > 0 {
+		return nil, fmt.Errorf("introdb: requests paused after Cloudflare HTTP 403; retry in %s", remaining.Round(time.Second))
+	}
+
+	c.inflightMu.Lock()
+	if call, ok := c.inflight[key]; ok {
+		c.inflightMu.Unlock()
+		select {
+		case <-call.done:
+			return call.response, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &inflightCall{done: make(chan struct{})}
+	c.inflight[key] = call
+	c.inflightMu.Unlock()
+
+	response, err := c.fetchUncached(ctx, q, key)
+	c.inflightMu.Lock()
+	call.response = response
+	call.err = err
+	close(call.done)
+	delete(c.inflight, key)
+	c.inflightMu.Unlock()
+	return response, err
+}
+
+func (c *Client) fetchUncached(ctx context.Context, q url.Values, key string) (*mediaResponse, error) {
 
 	if err := c.limiter.Wait(ctx); err != nil {
 		return nil, err
@@ -144,7 +233,7 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 			return nil, fmt.Errorf("introdb: create request: %w", err)
 		}
 		req.Header.Set("Accept", "application/json")
-		req.Header.Set("User-Agent", "Silo-Server/markers")
+		req.Header.Set("User-Agent", clientUserAgent)
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
@@ -158,7 +247,7 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 			resp.Body.Close()
 			// Cache negatives too so the next playback start doesn't trigger
 			// another fetch for known-empty content.
-			c.cache.Set(key, nil, c.cacheTTL)
+			c.cache.Set(key, nil, c.incompleteCacheTTL)
 			return nil, nil
 		}
 
@@ -191,8 +280,17 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 		}
 
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
+			if resp.StatusCode == http.StatusForbidden &&
+				(strings.EqualFold(resp.Header.Get("Server"), "cloudflare") || bytes.Contains(bytes.ToLower(body), []byte("cloudflare"))) {
+				c.pauseBlockedRequests(defaultBlockedCooldown)
+				ray := strings.TrimSpace(resp.Header.Get("CF-Ray"))
+				if ray != "" {
+					return nil, fmt.Errorf("introdb: Cloudflare blocked request (HTTP 403, cf-ray %s); paused requests for %s", ray, defaultBlockedCooldown)
+				}
+				return nil, fmt.Errorf("introdb: Cloudflare blocked request (HTTP 403); paused requests for %s", defaultBlockedCooldown)
+			}
 			return nil, fmt.Errorf("introdb: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
@@ -202,10 +300,36 @@ func (c *Client) fetch(ctx context.Context, q url.Values, key string) (*mediaRes
 		if decodeErr != nil {
 			return nil, fmt.Errorf("introdb: decode response: %w", decodeErr)
 		}
-		c.cache.Set(key, &out, c.cacheTTL)
+		c.cache.Set(key, &out, c.responseCacheTTL(&out))
 		return &out, nil
 	}
 	return nil, fmt.Errorf("introdb: max retries exceeded")
+}
+
+func (c *Client) pauseBlockedRequests(cooldown time.Duration) {
+	c.mu.Lock()
+	until := time.Now().Add(cooldown)
+	if until.After(c.blockedUntil) {
+		c.blockedUntil = until
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) blockedCooldownRemaining() time.Duration {
+	c.mu.RLock()
+	remaining := time.Until(c.blockedUntil)
+	c.mu.RUnlock()
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (c *Client) responseCacheTTL(response *mediaResponse) time.Duration {
+	if response == nil || len(response.Intro) == 0 || len(response.Credits) == 0 {
+		return c.incompleteCacheTTL
+	}
+	return c.cacheTTL
 }
 
 func retryAfterOrDefault(resp *http.Response, attempt int) time.Duration {
@@ -215,28 +339,6 @@ func retryAfterOrDefault(resp *http.Response, attempt int) time.Duration {
 		}
 	}
 	return time.Duration(1<<attempt) * time.Second
-}
-
-func cacheKeyEpisode(tmdbID, tvdbID, imdbID string, season, episode int, durationMS int64) string {
-	switch {
-	case tmdbID != "":
-		return fmt.Sprintf("tmdb:%s:s%de%d:d%d", tmdbID, season, episode, durationMS)
-	case tvdbID != "":
-		return fmt.Sprintf("tvdb:%s:s%de%d:d%d", tvdbID, season, episode, durationMS)
-	default:
-		return fmt.Sprintf("imdb:%s:s%de%d:d%d", imdbID, season, episode, durationMS)
-	}
-}
-
-func cacheKeyMovie(tmdbID, tvdbID, imdbID string, durationMS int64) string {
-	switch {
-	case tmdbID != "":
-		return fmt.Sprintf("tmdb:movie:%s:d%d", tmdbID, durationMS)
-	case tvdbID != "":
-		return fmt.Sprintf("tvdb:movie:%s:d%d", tvdbID, durationMS)
-	default:
-		return fmt.Sprintf("imdb:movie:%s:d%d", imdbID, durationMS)
-	}
 }
 
 // submitSegment contributes a single segment via POST /v3/submit. The API key
@@ -266,7 +368,7 @@ func (c *Client) submitSegment(ctx context.Context, body submitRequest) (*submit
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Silo-Server/markers")
+	req.Header.Set("User-Agent", clientUserAgent)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := c.httpClient.Do(req)
@@ -313,7 +415,7 @@ func (c *Client) fetchUserStats(ctx context.Context) (*userStatsResponse, error)
 		return nil, fmt.Errorf("introdb: create stats request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Silo-Server/markers")
+	req.Header.Set("User-Agent", clientUserAgent)
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
 	resp, err := c.httpClient.Do(req)
