@@ -283,6 +283,8 @@ func TestIsJSONResponseParsesTheMediaType(t *testing.T) {
 		"Application/JSON; charset=utf-8": true,
 		"application/problem+json":        true,
 		"application/json-seq":            false,
+		"application/json; charset":       true,
+		"; charset=utf-8":                 false,
 		"text/html; charset=UTF-8":        false,
 		"":                                false,
 	} {

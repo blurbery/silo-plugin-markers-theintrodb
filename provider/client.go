@@ -228,8 +228,10 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 // distinguish a block from an origin error. The origin reports errors as JSON;
 // a Cloudflare block is an HTML page.
 func isJSONResponse(resp *http.Response) bool {
-	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	if err != nil {
+	// A malformed parameter (e.g. a bare "; charset") still yields the media
+	// type alongside ErrInvalidMediaParameter, so only an empty type is fatal.
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaType == "" {
 		return false
 	}
 	return strings.EqualFold(mediaType, "application/json") || strings.HasSuffix(strings.ToLower(mediaType), "+json")
