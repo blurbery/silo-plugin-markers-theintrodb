@@ -27,8 +27,9 @@ const (
 	// playback should be able to discover newly contributed intro or credits
 	// markers without hammering TheIntroDB on repeated starts.
 	defaultIncompleteCacheTTL = 15 * time.Minute
-	// A Cloudflare block is not content-specific. Continuing with alternate IDs
-	// only multiplies rejected traffic and can prolong an automated block.
+	// A Cloudflare block is not content-specific. Further lookups only add
+	// rejected traffic and can prolong an automated block, so the host pauses
+	// the provider for this long.
 	defaultBlockedCooldown = 5 * time.Minute
 )
 
@@ -95,13 +96,14 @@ func (c *Client) FetchEpisode(ctx context.Context, tmdbID, tvdbID, imdbID string
 	if season <= 0 || episode <= 0 {
 		return nil, fmt.Errorf("introdb: episode lookup requires season and episode > 0 (got %d/%d)", season, episode)
 	}
-	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(q url.Values) {
-		q.Set("season", strconv.Itoa(season))
-		q.Set("episode", strconv.Itoa(episode))
-		if durationMS > 0 {
-			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
-		}
-	})
+	q := url.Values{}
+	setPreferredID(q, tmdbID, tvdbID, imdbID)
+	q.Set("season", strconv.Itoa(season))
+	q.Set("episode", strconv.Itoa(episode))
+	if durationMS > 0 {
+		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
+	}
+	return c.fetch(ctx, q)
 }
 
 // FetchMovie looks up segment timestamps for a movie.
@@ -110,35 +112,25 @@ func (c *Client) FetchMovie(ctx context.Context, tmdbID, tvdbID, imdbID string, 
 	if tmdbID == "" && tvdbID == "" && imdbID == "" {
 		return nil, fmt.Errorf("introdb: tmdb_id, tvdb_id, or imdb_id required")
 	}
-	return c.fetchUsingIDs(ctx, tmdbID, tvdbID, imdbID, func(q url.Values) {
-		if durationMS > 0 {
-			q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
-		}
-	})
+	q := url.Values{}
+	setPreferredID(q, tmdbID, tvdbID, imdbID)
+	if durationMS > 0 {
+		q.Set("duration_ms", strconv.FormatInt(durationMS, 10))
+	}
+	return c.fetch(ctx, q)
 }
 
-// fetchUsingIDs tries identifiers in TMDB, TVDB, IMDb order. A 404 advances
-// to the next identity because TheIntroDB can have a record indexed under one
-// provider but not another. The first actual media response wins.
-func (c *Client) fetchUsingIDs(ctx context.Context, tmdbID, tvdbID, imdbID string, setParams func(url.Values)) (*mediaResponse, error) {
-	for _, id := range []struct{ key, value string }{
-		{"tmdb_id", tmdbID},
-		{"tvdb_id", tvdbID},
-		{"imdb_id", imdbID},
-	} {
-		if id.value == "" {
-			continue
-		}
-		q := url.Values{id.key: []string{id.value}}
-		setParams(q)
-		response, err := c.fetch(ctx, q)
-		// Alternate identifiers help only when a particular identity is not
-		// indexed. They cannot recover transport, rate-limit, or WAF errors.
-		if err != nil || response != nil {
-			return response, err
-		}
+// setPreferredID writes exactly one id query parameter, preferring tmdb, then
+// tvdb, then imdb. At least one is assumed non-empty by the callers.
+func setPreferredID(q url.Values, tmdbID, tvdbID, imdbID string) {
+	switch {
+	case tmdbID != "":
+		q.Set("tmdb_id", tmdbID)
+	case tvdbID != "":
+		q.Set("tvdb_id", tvdbID)
+	default:
+		q.Set("imdb_id", imdbID)
 	}
-	return nil, nil
 }
 
 func (c *Client) fetch(ctx context.Context, q url.Values) (*mediaResponse, error) {
