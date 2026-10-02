@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -227,7 +228,11 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 // distinguish a block from an origin error. The origin reports errors as JSON;
 // a Cloudflare block is an HTML page.
 func isJSONResponse(resp *http.Response) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "application/json")
+	mediaType, _, err := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(mediaType, "application/json") || strings.HasSuffix(strings.ToLower(mediaType), "+json")
 }
 
 // isCloudflareResponse reports whether the response passed through Cloudflare.

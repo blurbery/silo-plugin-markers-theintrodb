@@ -276,3 +276,19 @@ func TestCloseResponseToleratesMissingBody(t *testing.T) {
 	closeResponse(nil)
 	closeResponse(&http.Response{})
 }
+
+func TestIsJSONResponseParsesTheMediaType(t *testing.T) {
+	for contentType, want := range map[string]bool{
+		"application/json":                true,
+		"Application/JSON; charset=utf-8": true,
+		"application/problem+json":        true,
+		"application/json-seq":            false,
+		"text/html; charset=UTF-8":        false,
+		"":                                false,
+	} {
+		resp := &http.Response{Header: http.Header{"Content-Type": []string{contentType}}}
+		if got := isJSONResponse(resp); got != want {
+			t.Errorf("isJSONResponse(%q) = %v, want %v", contentType, got, want)
+		}
+	}
+}
