@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -201,7 +202,7 @@ func (c *Client) fetchMedia(ctx context.Context, reqURL, apiKey string) (*mediaR
 			continue
 		}
 
-		if resp.StatusCode == http.StatusForbidden && !isJSONResponse(resp) {
+		if resp.StatusCode == http.StatusForbidden && !isJSONResponse(resp) && isCloudflareResponse(resp) {
 			closeResponse(resp)
 			return nil, cloudflareBlockError(resp)
 		}
@@ -229,6 +230,14 @@ func isJSONResponse(resp *http.Response) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type"))), "application/json")
 }
 
+// isCloudflareResponse reports whether the response passed through Cloudflare.
+// Without that provenance a non-JSON 403 is an ordinary error and keeps its
+// body instead of pausing the provider.
+func isCloudflareResponse(resp *http.Response) bool {
+	return strings.TrimSpace(resp.Header.Get("CF-Ray")) != "" ||
+		strings.Contains(strings.ToLower(resp.Header.Get("Server")), "cloudflare")
+}
+
 // cloudflareBlockError asks the host to pause the provider instead of letting
 // every queued lookup reach the block. The HTML block page is dropped; the
 // CF-Ray value is enough to diagnose it.
@@ -240,8 +249,16 @@ func cloudflareBlockError(resp *http.Response) error {
 	return &RetryAfterError{RetryAfter: defaultBlockedCooldown, Message: message}
 }
 
+// responseCacheTTL keeps a response for the full TTL only when it has a
+// usable intro and credits. TheIntroDB marks a missing credits segment with a
+// zero-start entry that convertMarkers discards, so counting array entries
+// would cache that miss for a day. The file duration isn't known here, so an
+// open-ended segment counts as usable.
 func responseCacheTTL(response *mediaResponse) time.Duration {
-	if response == nil || len(response.Intro) == 0 || len(response.Credits) == 0 {
+	unbounded := time.Duration(math.MaxInt64)
+	if response == nil ||
+		len(convertMarkers(response.Intro, MarkerKindIntro, unbounded)) == 0 ||
+		len(convertMarkers(response.Credits, MarkerKindCredits, unbounded)) == 0 {
 		return defaultIncompleteCacheTTL
 	}
 	return defaultCacheTTL

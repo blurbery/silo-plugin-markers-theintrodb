@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestFetchEpisodeSendsTVDBWhenNoTMDB(t *testing.T) {
@@ -177,6 +178,25 @@ func TestFetchEpisodeStopsAndCoolsDownAfterCloudflareForbidden(t *testing.T) {
 	}
 }
 
+func TestFetchEpisodeReportsNonCloudflareForbiddenAsHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A non-JSON 403 without Cloudflare provenance, e.g. from a proxy in
+		// front of a self-hosted mirror.
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("forbidden by proxy"))
+	}))
+	defer srv.Close()
+
+	c := NewClient("")
+	c.SetBaseURL(srv.URL)
+	_, err := c.FetchEpisode(context.Background(), "111", "", "", 1, 2, 0)
+	var blocked *RetryAfterError
+	if err == nil || errors.As(err, &blocked) || !strings.Contains(err.Error(), "HTTP 403: forbidden by proxy") {
+		t.Fatalf("error = %v, want plain HTTP 403 without a provider cooldown", err)
+	}
+}
+
 func TestFetchEpisodeReportsOriginForbiddenAsHTTPError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Cloudflare fronts every API response, including origin JSON errors.
@@ -197,18 +217,27 @@ func TestFetchEpisodeReportsOriginForbiddenAsHTTPError(t *testing.T) {
 }
 
 func TestResponseCacheTTLUsesShortTTLUntilIntroAndCreditsExist(t *testing.T) {
-	intro := segmentTimestamps{}
-	credits := segmentTimestamps{}
-	if got := responseCacheTTL(nil); got != defaultIncompleteCacheTTL {
-		t.Fatalf("missing response TTL = %s, want %s", got, defaultIncompleteCacheTTL)
-	}
-	if got := responseCacheTTL(&mediaResponse{Intro: []segmentTimestamps{intro}}); got != defaultIncompleteCacheTTL {
-		t.Fatalf("partial response TTL = %s, want %s", got, defaultIncompleteCacheTTL)
-	}
-	if got := responseCacheTTL(&mediaResponse{
-		Intro: []segmentTimestamps{intro}, Credits: []segmentTimestamps{credits},
-	}); got != defaultCacheTTL {
-		t.Fatalf("complete response TTL = %s, want %s", got, defaultCacheTTL)
+	ms := func(v int64) *int64 { return &v }
+	intro := segmentTimestamps{StartMs: ms(5_000), EndMs: ms(60_000)}
+	credits := segmentTimestamps{StartMs: ms(1_200_000), EndMs: ms(1_260_000)}
+	openEndedCredits := segmentTimestamps{StartMs: ms(1_200_000)}
+	// TheIntroDB's no-credits sentinel: an entry that convertMarkers discards.
+	noCredits := segmentTimestamps{StartMs: ms(0)}
+	for _, test := range []struct {
+		name     string
+		response *mediaResponse
+		want     time.Duration
+	}{
+		{name: "missing response", response: nil, want: defaultIncompleteCacheTTL},
+		{name: "intro only", response: &mediaResponse{Intro: []segmentTimestamps{intro}}, want: defaultIncompleteCacheTTL},
+		{name: "no-credits sentinel", response: &mediaResponse{Intro: []segmentTimestamps{intro}, Credits: []segmentTimestamps{noCredits}}, want: defaultIncompleteCacheTTL},
+		{name: "empty entries", response: &mediaResponse{Intro: []segmentTimestamps{{}}, Credits: []segmentTimestamps{{}}}, want: defaultIncompleteCacheTTL},
+		{name: "complete", response: &mediaResponse{Intro: []segmentTimestamps{intro}, Credits: []segmentTimestamps{credits}}, want: defaultCacheTTL},
+		{name: "credits to the end of the file", response: &mediaResponse{Intro: []segmentTimestamps{intro}, Credits: []segmentTimestamps{openEndedCredits}}, want: defaultCacheTTL},
+	} {
+		if got := responseCacheTTL(test.response); got != test.want {
+			t.Errorf("%s: TTL = %s, want %s", test.name, got, test.want)
+		}
 	}
 }
 
