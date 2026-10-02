@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -243,4 +244,40 @@ func TestResponseCacheTTLUsesShortTTLUntilIntroAndCreditsExist(t *testing.T) {
 	}); got != defaultCacheTTL {
 		t.Fatalf("complete response TTL = %s, want %s", got, defaultCacheTTL)
 	}
+}
+
+// trackedBody records how much of a response body was consumed and whether it
+// was closed, so the status branches can be checked without a live server.
+type trackedBody struct {
+	reader io.Reader
+	read   int
+	closed bool
+}
+
+func (b *trackedBody) Read(p []byte) (int, error) {
+	n, err := b.reader.Read(p)
+	b.read += n
+	return n, err
+}
+
+func (b *trackedBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+func TestCloseResponseDrainsAndClosesBody(t *testing.T) {
+	body := &trackedBody{reader: strings.NewReader(strings.Repeat("x", 64))}
+	closeResponse(&http.Response{Body: body})
+
+	if !body.closed {
+		t.Error("response body was not closed")
+	}
+	if body.read != 64 {
+		t.Errorf("drained %d bytes, want 64 so the connection stays reusable", body.read)
+	}
+}
+
+func TestCloseResponseToleratesMissingBody(t *testing.T) {
+	closeResponse(nil)
+	closeResponse(&http.Response{})
 }
